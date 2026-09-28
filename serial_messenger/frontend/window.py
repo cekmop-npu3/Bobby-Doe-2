@@ -1,0 +1,490 @@
+"""Graphical interface for the variant 1 COM messenger."""
+
+from __future__ import annotations
+
+from contextlib import ExitStack
+import logging
+from typing import override
+
+from PyQt6 import QtCore, QtGui, QtWidgets
+
+from backend import BAUD_RATES, SerialConnection
+from backend.frame import FrameTransmission, encode_frame
+
+__all__ = ("SerialMessenger",)
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+class ImmediateInput(QtWidgets.QPlainTextEdit):
+    """Text area that sends printable characters immediately."""
+
+    character_entered = QtCore.pyqtSignal(str)
+
+    def __init__(self) -> None:
+        """Create the immediate-transmission input area."""
+        super().__init__()
+
+        self.setPlaceholderText("Type here — every character is sent immediately")
+
+    @override
+    def keyPressEvent(
+        self,
+        event: QtGui.QKeyEvent | None,
+    ) -> None:
+        """Send entered characters immediately."""
+        if event is None:
+            return
+
+        text = event.text()
+
+        if event.key() in (
+            QtCore.Qt.Key.Key_Return,
+            QtCore.Qt.Key.Key_Enter,
+        ):
+            super().keyPressEvent(event)
+            self.character_entered.emit("\n")
+            return
+
+        super().keyPressEvent(event)
+
+        if text and text.isprintable():
+            self.character_entered.emit(text)
+
+
+class SerialMessenger(QtWidgets.QWidget):
+    """Present connection controls and serial messaging UI."""
+
+    def __init__(self) -> None:
+        """Build the application window."""
+        super().__init__()
+
+        self.connection: SerialConnection | None = None
+        self._connection_scope = ExitStack()
+
+        self.sent_characters = 0
+        # Prevent recursive or repeated QMessageBox calls caused by
+        # queued serial signals.
+        self._handling_error = False
+
+        self.setWindowTitle("COM Port Messenger")
+        self.resize(1200, 900)
+        self.setMinimumSize(640, 420)
+
+        self._create_widgets()
+        self._create_layout()
+        self._apply_style()
+        self._connect_signals()
+        self._load_ports()
+        self._refresh_state()
+
+        self.input_area.setFocus()
+
+    def _create_widgets(self) -> None:
+        """Create controls and text widgets."""
+        self.port_choice = QtWidgets.QComboBox()
+
+        self.baud_rate_choice = QtWidgets.QComboBox()
+
+        for value in BAUD_RATES:
+            self.baud_rate_choice.addItem(
+                str(value),
+                value,
+            )
+
+        self.baud_rate_choice.setCurrentIndex(-1)
+        self.baud_rate_choice.setEnabled(False)
+
+        self.input_area = ImmediateInput()
+        self.input_area.setEnabled(False)
+        self.input_area.setVerticalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+
+        self.output_area = QtWidgets.QPlainTextEdit()
+        self.output_area.setReadOnly(True)
+        self.output_area.setVerticalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+
+        self.state_label = QtWidgets.QTextBrowser()
+        self.state_label.setReadOnly(True)
+        self.state_label.setOpenExternalLinks(False)
+        self.state_label.setMinimumHeight(145)
+
+    def _create_layout(self) -> None:
+        """Arrange the resizable controls and text areas."""
+        layout = QtWidgets.QGridLayout(self)
+        layout.setContentsMargins(22, 18, 22, 12)
+        layout.setHorizontalSpacing(12)
+        layout.setVerticalSpacing(12)
+
+        port_box = self._section("COM port")
+        self._content_layout(port_box).addWidget(self.port_choice)
+
+        baud_rate_box = self._section("Baud rate")
+        self._content_layout(baud_rate_box).addWidget(self.baud_rate_choice)
+
+        controls = QtWidgets.QHBoxLayout()
+        controls.addWidget(port_box)
+        controls.addWidget(baud_rate_box)
+        controls.addStretch()
+        layout.addLayout(controls, 0, 0, 1, 2)
+
+        outgoing = self._section("Input")
+        self._content_layout(outgoing).addWidget(self.input_area)
+
+        incoming = self._section("Output")
+        self._content_layout(incoming).addWidget(self.output_area)
+
+        layout.addWidget(outgoing, 1, 0)
+        layout.addWidget(incoming, 1, 1)
+        state = self._section("Frame status")
+        self._content_layout(state).addWidget(self.state_label)
+        layout.addWidget(state, 2, 0, 1, 2)
+
+        layout.setRowStretch(1, 1)
+        layout.setColumnStretch(0, 1)
+        layout.setColumnStretch(1, 1)
+
+    @staticmethod
+    def _section(
+        title: str,
+    ) -> QtWidgets.QGroupBox:
+        """Create a titled visual section."""
+        section = QtWidgets.QGroupBox(title)
+        box = QtWidgets.QVBoxLayout(section)
+        box.setContentsMargins(10, 18, 10, 10)
+        return section
+
+    @staticmethod
+    def _content_layout(
+        frame: QtWidgets.QGroupBox,
+    ) -> QtWidgets.QVBoxLayout:
+        """Return the section's vertical content layout."""
+        layout = frame.layout()
+
+        if not isinstance(
+            layout,
+            QtWidgets.QVBoxLayout,
+        ):
+            raise TypeError("Section does not have a vertical layout.")
+
+        return layout
+
+    def _connect_signals(self) -> None:
+        """Connect UI signals."""
+        self.port_choice.currentIndexChanged.connect(self._port_selected)
+
+        self.baud_rate_choice.currentIndexChanged.connect(self._change_baud_rate)
+
+        self.input_area.character_entered.connect(self._send_character)
+
+    def _load_ports(self) -> None:
+        """Load currently available serial ports."""
+        ports = list(SerialConnection.available_ports())
+
+        self.port_choice.addItems(ports)
+
+        self.port_choice.setCurrentIndex(-1)
+
+    def _port_selected(self) -> None:
+        """Enable speed selection only after a COM port is selected.
+
+        :return: ``None``.
+        """
+        if self._handling_error:
+            return
+
+        has_port = bool(self.port_choice.currentText().strip())
+        self.baud_rate_choice.setEnabled(has_port)
+
+        if not has_port:
+            self.baud_rate_choice.setCurrentIndex(-1)
+            return
+
+        self._try_open()
+
+    def _try_open(self) -> None:
+        """Open the selected COM port when both choices exist."""
+        if self.connection is not None:
+            return
+
+        if self._handling_error:
+            return
+
+        port_name = self.port_choice.currentText().strip()
+
+        baud_rate = self.baud_rate_choice.currentData()
+
+        if not port_name or baud_rate is None:
+            return
+
+        try:
+            connection = self._connection_scope.enter_context(
+                SerialConnection(
+                    port_name,
+                    baud_rate,
+                )
+            )
+
+        except ConnectionError as error:
+            LOGGER.warning(
+                "Connection attempt failed: %s",
+                error,
+            )
+
+            self._show_open_error(str(error))
+
+            return
+
+        self.connection = connection
+
+        connection.received.connect(self._append_received)
+
+        connection.frame_received.connect(self._show_received_frame)
+
+        connection.error.connect(self._show_error)
+
+        LOGGER.info(
+            "Connected frontend to serial port %s.",
+            port_name,
+        )
+
+        self._port_opened()
+
+    def _change_baud_rate(self) -> None:
+        """Reconnect the selected port when the baud rate changes.
+
+        :return: ``None``.
+        """
+        if self._handling_error:
+            return
+
+        baud_rate = self.baud_rate_choice.currentData()
+        if baud_rate is None:
+            return
+
+        if self.connection is not None:
+            if baud_rate == self.connection.baud_rate:
+                return
+            self._close_connection()
+
+        self._try_open()
+
+    def _port_opened(self) -> None:
+        """Lock the port but allow changing baud rate and enable input."""
+        self.port_choice.setEnabled(False)
+        self.input_area.setEnabled(True)
+        self.input_area.setFocus()
+
+    def _send_character(
+        self,
+        character: str,
+    ) -> None:
+        """Send one entered character."""
+        connection = self.connection
+
+        if connection is None:
+            return
+
+        transmission = connection.send_character(character)
+        if transmission is not None:
+            self.sent_characters += 1
+            self._show_frame(transmission)
+
+    def _append_received(
+        self,
+        text: str,
+    ) -> None:
+        """Append received user data to the output area."""
+        cursor = self.output_area.textCursor()
+
+        cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+
+        cursor.insertText(
+            text.replace(
+                "\r\n",
+                "\n",
+            ).replace(
+                "\r",
+                "\n",
+            )
+        )
+
+        self.output_area.setTextCursor(cursor)
+
+        self.output_area.ensureCursorVisible()
+
+    def _refresh_state(self) -> None:
+        """Refresh the status display."""
+        self.state_label.setHtml(
+            "<b>Флаг Данные Тип Приоритет Контроль Резерв</b>"
+        )
+
+    def _show_frame(self, transmission: FrameTransmission) -> None:
+        """Show the most recently transmitted frame before and after stuffing."""
+        self.state_label.append(transmission.before)
+        self.state_label.append(transmission.after_html)
+        self.state_label.verticalScrollBar().setValue(
+            self.state_label.verticalScrollBar().maximum()
+        )
+
+    def _show_received_frame(self, frame: object) -> None:
+        """Show the last recognized incoming frame in the same required format."""
+        data = getattr(frame, "data", None)
+        if isinstance(data, bytes):
+            self._show_frame(encode_frame(data.decode("utf-8")))
+
+    def _show_open_error(
+        self,
+        message: str,
+    ) -> None:
+        """Show an error that occurred before a connection existed."""
+        if self._handling_error:
+            return
+
+        self._handling_error = True
+
+        try:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "COM Port Messenger",
+                message,
+            )
+
+        finally:
+            self._handling_error = False
+
+    def _show_error(
+        self,
+        message: str,
+    ) -> None:
+        """Show one error and safely tear down the active connection."""
+        # A queued signal belonging to an already-reset connection
+        # should simply be ignored.
+        if self.connection is None:
+            return
+
+        # Prevent recursive QMessageBoxes while Qt is running the
+        # modal dialog's nested event loop.
+        if self._handling_error:
+            return
+
+        self._handling_error = True
+
+        try:
+            LOGGER.error(
+                "User-visible serial error: %s",
+                message,
+            )
+
+            self._reset_connection_controls()
+
+            QtWidgets.QMessageBox.critical(
+                self,
+                "COM Port Messenger",
+                message,
+            )
+
+        finally:
+            self._handling_error = False
+
+    def _close_connection(self) -> None:
+        """Stop the active connection without changing selector values.
+
+        :return: ``None``.
+        """
+        connection = self.connection
+
+        # Clear the reference FIRST so any queued error signal from the
+        # old connection is ignored by _show_error().
+        self.connection = None
+
+        if connection is not None:
+            try:
+                connection.received.disconnect(self._append_received)
+            except TypeError:
+                pass
+
+            try:
+                connection.error.disconnect(self._show_error)
+            except TypeError:
+                pass
+
+            try:
+                connection.frame_received.disconnect(self._show_received_frame)
+            except TypeError:
+                pass
+
+        self._connection_scope.close()
+        self._connection_scope = ExitStack()
+
+    def _reset_connection_controls(self) -> None:
+        """Close the active connection and unlock cleared selectors.
+
+        :return: ``None``.
+        """
+        self._close_connection()
+
+        self.port_choice.setEnabled(True)
+
+        # Clear the port first. Programmatically changing
+        # baud_rate_choice emits currentIndexChanged, but _try_open()
+        # then sees no selected COM port and does nothing.
+        self.port_choice.setCurrentIndex(-1)
+
+        self.baud_rate_choice.setCurrentIndex(-1)
+        self.baud_rate_choice.setEnabled(False)
+
+        self.input_area.setEnabled(False)
+
+    def _apply_style(self) -> None:
+        """Apply the application style."""
+        self.setStyleSheet("""
+            QWidget {
+                background: #f0f0f0;
+                color: #202020;
+                font: 14px 'Segoe UI';
+            }
+
+            QGroupBox {
+                border: 1px solid #c8c8c8;
+                margin-top: 9px;
+                padding-top: 7px;
+            }
+
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 8px;
+                padding: 0 3px;
+            }
+
+            QComboBox {
+                background: white;
+                border: 1px solid #a8a8a8;
+                padding: 5px 8px;
+                min-height: 24px;
+            }
+
+            QPlainTextEdit {
+                background: white;
+                border: 1px solid #303030;
+                padding: 4px;
+                selection-background-color: #9bbcff;
+            }
+            """)
+
+    @override
+    def closeEvent(
+        self,
+        event: QtGui.QCloseEvent | None,
+    ) -> None:
+        """Close timers and the serial connection before exiting."""
+        self._close_connection()
+
+        LOGGER.info("Serial Messenger window closed.")
+
+        if event is not None:
+            event.accept()
