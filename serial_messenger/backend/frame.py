@@ -1,187 +1,287 @@
-"""Frame format and bit stuffing for laboratory work No. 2, variant 1."""
+"""Packet serialization and stream decoding for laboratory work No. 2."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, Iterable
 
 
-START_FLAG: Final[bytes] = b"450501-1"
-RESERVED_BYTES: Final[int] = 10
+START_FLAG: Final[bytes] = b"450502-1"
 SERVICE_BYTES: Final[int] = 3
+RESERVED_BYTES: Final[int] = 10
 MAX_FRAME_SIZE: Final[int] = 100
-_BODY_TRAILER_SIZE: Final[int] = SERVICE_BYTES + RESERVED_BYTES
+MAX_DATA_SIZE: Final[int] = (
+    MAX_FRAME_SIZE - len(START_FLAG) - SERVICE_BYTES - RESERVED_BYTES
+)
+BODY_SIZE: Final[int] = MAX_FRAME_SIZE - len(START_FLAG)
+BODY_BITS: Final[int] = BODY_SIZE * 8
+
+
+def _bits_of_byte(value: int) -> Iterable[int]:
+    """Yield one byte from the most significant bit to the least."""
+    for shift in range(7, -1, -1):
+        yield (value >> shift) & 1
+
+
+def _flag_bits() -> tuple[int, ...]:
+    return tuple(bit for byte in START_FLAG for bit in _bits_of_byte(byte))
+
+
+FLAG_BITS: Final[tuple[int, ...]] = _flag_bits()
+FLAG_LENGTH: Final[int] = len(FLAG_BITS)
+STUFF_BIT: Final[int] = 1 - FLAG_BITS[-1]
+
+
+def _build_failure_table(pattern: tuple[int, ...]) -> tuple[int, ...]:
+    """Return the KMP fallback state for every prefix of ``pattern``."""
+    table = [0] * len(pattern)
+    state = 0
+    for position in range(1, len(pattern)):
+        while state and pattern[position] != pattern[state]:
+            state = table[state - 1]
+        if pattern[position] == pattern[state]:
+            state += 1
+        table[position] = state
+    return tuple(table)
+
+
+FLAG_FAILURE: Final[tuple[int, ...]] = _build_failure_table(FLAG_BITS)
+
+
+class _FlagTracker:
+    """KMP state machine used identically while stuffing and de-stuffing."""
+
+    __slots__ = ("state",)
+
+    def __init__(self) -> None:
+        self.state = 0
+
+    def consume(self, bit: int) -> bool:
+        """Consume a bit and report whether 63 flag bits now match."""
+        while self.state and bit != FLAG_BITS[self.state]:
+            self.state = FLAG_FAILURE[self.state - 1]
+        if bit == FLAG_BITS[self.state]:
+            self.state += 1
+        return self.state == FLAG_LENGTH - 1
+
+
+class _BitWriter:
+    """Append individual MSB-first bits to a compact byte buffer."""
+
+    __slots__ = ("_bytes", "_value", "_count")
+
+    def __init__(self) -> None:
+        self._bytes = bytearray()
+        self._value = 0
+        self._count = 0
+
+    def append(self, bit: int) -> None:
+        self._value = (self._value << 1) | bit
+        self._count += 1
+        if self._count == 8:
+            self._bytes.append(self._value)
+            self._value = 0
+            self._count = 0
+
+    def finish(self) -> bytes:
+        if self._count:
+            self._bytes.append(self._value << (8 - self._count))
+            self._value = 0
+            self._count = 0
+        return bytes(self._bytes)
+
+
+def _binary_byte(value: int) -> str:
+    return f"{value:08b}"
+
+
+def _format_field(field: bytes) -> str:
+    return ",".join(_binary_byte(value) for value in field)
 
 
 @dataclass(frozen=True)
 class Frame:
-    """One application frame.
-
-    ``frame_type`` can later distinguish data and control frames,
-    ``priority`` can select a transmission queue, and ``checksum`` can hold a
-    check value.  The assignment requires these service fields to be zero now.
-    """
+    """One fixed-size frame before bit stuffing."""
 
     data: bytes
     frame_type: int = 0
-    priority: int = 0
+    frame_number: int = 0
     checksum: int = 0
     reserved: bytes = bytes(RESERVED_BYTES)
 
     def __post_init__(self) -> None:
-        if not self.data or len(self.data) > MAX_FRAME_SIZE - len(START_FLAG) - _BODY_TRAILER_SIZE:
+        if not self.data or len(self.data) > MAX_DATA_SIZE:
             raise ValueError("Data field does not fit into a frame.")
-        if any((self.frame_type, self.priority, self.checksum)):
+        if any((self.frame_type, self.frame_number, self.checksum)):
             raise ValueError("Service fields must be zero in this laboratory work.")
         if self.reserved != bytes(RESERVED_BYTES):
             raise ValueError("Reserved bytes must be zero and have length 10.")
 
     @property
+    def flag(self) -> bytes:
+        return START_FLAG
+
+    def padded_data(self) -> bytes:
+        return self.data.ljust(MAX_DATA_SIZE, b"\x00")
+
+    @property
     def body(self) -> bytes:
-        return self.data + bytes((self.frame_type, self.priority, self.checksum)) + self.reserved
+        return b"".join(
+            (
+                bytes((self.frame_type, self.frame_number)),
+                self.padded_data(),
+                bytes((self.checksum,)),
+                self.reserved,
+            )
+        )
+
+    def to_bytes(self) -> bytes:
+        return START_FLAG + self.body
 
 
 @dataclass(frozen=True)
 class FrameTransmission:
-    """Wire bytes and binary representations for the status window."""
+    """Bytes written to the port and values displayed in the status area."""
 
     wire: bytes
     before: str
     after_html: str
 
 
-def _bits(value: int) -> str:
-    return f"{value:08b}"
+def _stuff_body(fields: tuple[bytes, ...]) -> tuple[bytes, list[str]]:
+    """Serialize body fields and interrupt every 63-bit flag prefix."""
+    tracker = _FlagTracker()
+    writer = _BitWriter()
+    displayed: list[str] = []
 
-
-def _field_before(value: bytes) -> str:
-    return ",".join(_bits(byte) for byte in value)
-
-
-def _stuff_field_bits(fields: list[bytes]) -> tuple[list[str], str]:
-    """Stuff a zero after every run of five one bits.
-
-    The returned HTML keeps inserted zeros underlined.  Only those zeroes are
-    replacements, so ordinary data remains unadorned.
-    """
-    ones = 0
-    rendered: list[str] = []
-    wire_bits: list[str] = []
     for field in fields:
-        output: list[str] = []
-        for byte in field:
-            for bit in _bits(byte):
-                output.append(bit)
-                wire_bits.append(bit)
-                ones = ones + 1 if bit == "1" else 0
-                if ones == 5:
-                    output.append("<u>0</u>")
-                    wire_bits.append("0")
-                    ones = 0
-        rendered.append("".join(output))
-    return rendered, "".join(wire_bits)
+        # Каждый исходный байт остаётся отдельным значением в представлении:
+        # это позволяет отделять значения запятыми и при этом подчёркивать
+        # вставленный бит ровно в том месте, где он появился.
+        byte_views: list[str] = []
+        for value in field:
+            view: list[str] = []
+            for bit in _bits_of_byte(value):
+                writer.append(bit)
+                view.append(str(bit))
+                if tracker.consume(bit):
+                    writer.append(STUFF_BIT)
+                    view.append(f"<u>{STUFF_BIT}</u>")
+                    tracker.consume(STUFF_BIT)
+            byte_views.append("".join(view))
+        displayed.append(",".join(byte_views))
+
+    return writer.finish(), displayed
 
 
-def _pack_bits(bits: str) -> bytes:
-    padding = (-len(bits)) % 8
-    return bytes(int((bits + "0" * padding)[offset : offset + 8], 2) for offset in range(0, len(bits) + padding, 8))
-
-
-def encode_frame(character: str) -> FrameTransmission:
-    """Build, bit-stuff and serialize the frame for one entered character."""
-    data = character.encode("utf-8")
+def encode_frame(text: str | bytes) -> FrameTransmission:
+    """Make a 100-byte frame, then apply bit stuffing to its body."""
+    data = text if isinstance(text, bytes) else text.encode("utf-8")
     frame = Frame(data=data)
-    fields = [frame.data, bytes((0,)), bytes((0,)), bytes((0,)), frame.reserved]
-    stuffed_fields, stuffed_bits = _stuff_field_bits(fields)
-    wire = START_FLAG + _pack_bits(stuffed_bits)
-    if len(wire) > MAX_FRAME_SIZE:
-        raise ValueError("Stuffed frame exceeds 100 bytes.")
+    # В физический кадр входят и резервные байты: они участвуют в stuffing и
+    # передаются по COM-порту. В окно состояния они не попадают по условию.
+    wire_fields = (
+        bytes((frame.frame_type,)),
+        bytes((frame.frame_number,)),
+        frame.padded_data(),
+        bytes((frame.checksum,)),
+        frame.reserved,
+    )
+    stuffed_body, displayed = _stuff_body(wire_fields)
 
-    before = " ".join(_field_before(field) for field in [START_FLAG, *fields[:-1]])
-    after = " ".join([_field_before(START_FLAG), *stuffed_fields[:-1]])
-    return FrameTransmission(wire=wire, before=before, after_html=after)
-
-
-def _utf8_length(first_byte: int) -> int | None:
-    if first_byte < 0x80:
-        return 1
-    if 0xC2 <= first_byte <= 0xDF:
-        return 2
-    if 0xE0 <= first_byte <= 0xEF:
-        return 3
-    if 0xF0 <= first_byte <= 0xF4:
-        return 4
-    return None
+    # Значения выводятся в порядке полей кадра, но без резервных байтов.
+    visible_fields = wire_fields[:-1]
+    before = " ".join(
+        (_format_field(START_FLAG), *map(_format_field, visible_fields))
+    )
+    after = " ".join((_format_field(START_FLAG), *displayed[:-1]))
+    return FrameTransmission(START_FLAG + stuffed_body, before, after)
 
 
 class FrameDecoder:
-    """Incrementally recognize frames in arbitrary chunks of serial bytes."""
+    """Accumulate serial bytes and yield only complete valid frames."""
 
     def __init__(self) -> None:
-        self._buffer = bytearray()
+        self._source = bytearray()
 
-    def feed(self, data: bytes) -> list[Frame]:
-        """Return every complete valid frame present after adding ``data``."""
-        self._buffer.extend(data)
-        frames: list[Frame] = []
+    def feed(self, received: bytes) -> list[Frame]:
+        self._source.extend(received)
+        ready: list[Frame] = []
+
         while True:
-            marker = self._buffer.find(START_FLAG)
-            if marker < 0:
-                del self._buffer[:-len(START_FLAG) + 1]
-                return frames
-            if marker:
-                del self._buffer[:marker]
-            decoded = self._decode_body(bytes(self._buffer[len(START_FLAG) :]))
+            flag_offset = self._source.find(START_FLAG)
+            if flag_offset < 0:
+                self._keep_possible_flag_prefix()
+                return ready
+            if flag_offset:
+                del self._source[:flag_offset]
+
+            decoded = self._decode_one(memoryview(self._source)[len(START_FLAG) :])
             if decoded is None:
-                return frames
-            frame, consumed = decoded
-            if frame is False:
-                del self._buffer[0]
+                return ready
+            frame, wire_bytes = decoded
+            if frame is None:
+                # Discard one byte and scan again: a real flag may start in
+                # the remainder of a malformed candidate.
+                del self._source[0]
                 continue
-            frames.append(frame)
-            del self._buffer[: len(START_FLAG) + consumed]
+            ready.append(frame)
+            del self._source[: len(START_FLAG) + wire_bytes]
+
+    def _keep_possible_flag_prefix(self) -> None:
+        """Retain only bytes that could still start a split start flag."""
+        keep = min(len(self._source), len(START_FLAG) - 1)
+        if len(self._source) > keep:
+            del self._source[:-keep]
 
     @staticmethod
-    def _decode_body(raw: bytes) -> tuple[Frame | bool, int] | None:
-        output: list[int] = []
-        current = 0
-        bit_count = 0
-        ones = 0
-        data_size: int | None = None
-        required_bits: int | None = None
+    def _decode_one(raw: memoryview) -> tuple[Frame | None, int] | None:
+        tracker = _FlagTracker()
+        body = bytearray()
+        byte_value = 0
+        bits_in_byte = 0
+        skip_stuff_bit = False
         consumed_bits = 0
-        for byte in raw:
-            for shift in range(7, -1, -1):
-                bit = (byte >> shift) & 1
+
+        for value in raw:
+            for bit in _bits_of_byte(value):
                 consumed_bits += 1
-                if ones == 5:
-                    if bit != 0:
-                        return False, 0
-                    ones = 0
+                if skip_stuff_bit:
+                    if bit != STUFF_BIT:
+                        return None, 0
+                    tracker.consume(bit)
+                    skip_stuff_bit = False
+                    if len(body) == BODY_SIZE:
+                        return FrameDecoder._build_frame(body, consumed_bits)
                     continue
-                current = (current << 1) | bit
-                bit_count += 1
-                ones = ones + 1 if bit else 0
-                if bit_count != 8:
-                    continue
-                output.append(current)
-                current = 0
-                bit_count = 0
-                if data_size is None:
-                    data_size = _utf8_length(output[0])
-                    if data_size is None:
-                        return False, 0
-                    required_bits = (data_size + _BODY_TRAILER_SIZE) * 8
-                if required_bits is not None and len(output) * 8 == required_bits:
-                    payload = bytes(output)
-                    try:
-                        text = payload[:data_size].decode("utf-8")
-                        if len(text) != 1:
-                            return False, 0
-                        if any(payload[data_size : data_size + SERVICE_BYTES]):
-                            return False, 0
-                        frame = Frame(data=payload[:data_size], reserved=payload[-RESERVED_BYTES:])
-                    except (UnicodeDecodeError, ValueError):
-                        return False, 0
-                    return frame, (consumed_bits + 7) // 8
+
+                byte_value = (byte_value << 1) | bit
+                bits_in_byte += 1
+                if bits_in_byte == 8:
+                    body.append(byte_value)
+                    byte_value = 0
+                    bits_in_byte = 0
+
+                if tracker.consume(bit):
+                    skip_stuff_bit = True
+                if len(body) == BODY_SIZE and not skip_stuff_bit:
+                    return FrameDecoder._build_frame(body, consumed_bits)
         return None
+
+    @staticmethod
+    def _build_frame(body: bytearray, consumed_bits: int) -> tuple[Frame | None, int]:
+        data_start = 2
+        data_end = data_start + MAX_DATA_SIZE
+        payload = bytes(body[data_start:data_end]).rstrip(b"\x00")
+        try:
+            payload.decode("utf-8")
+            frame = Frame(
+                data=payload,
+                frame_type=body[0],
+                frame_number=body[1],
+                checksum=body[data_end],
+                reserved=bytes(body[-RESERVED_BYTES:]),
+            )
+        except (UnicodeDecodeError, ValueError):
+            return None, 0
+        return frame, (consumed_bits + 7) // 8

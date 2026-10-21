@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Generator
 from types import TracebackType
 from typing import Final, Self, override
@@ -11,12 +10,9 @@ from PyQt6 import QtCore
 from serial import Serial, SerialException, SerialTimeoutException
 from serial.tools import list_ports
 
-from .frame import FrameDecoder, FrameTransmission, encode_frame
+from .frame import MAX_DATA_SIZE, FrameDecoder, FrameTransmission, encode_frame
 
 __all__ = ("BAUD_RATES", "SerialConnection")
-
-
-LOGGER = logging.getLogger(__name__)
 
 
 BYTE_SIZE: Final[int] = 8
@@ -62,6 +58,8 @@ class ReceiverThread(QtCore.QThread):
     @override
     def run(self) -> None:
         """Read available bytes until the thread is stopped."""
+        # Один декодер обслуживает весь срок жизни потока: его внутренний
+        # буфер хранит кадр, если COM-порт отдал его не целиком.
         decoder = FrameDecoder()
 
         while self._active:
@@ -72,9 +70,13 @@ class ReceiverThread(QtCore.QThread):
                 waiting = self.port.in_waiting
 
                 if waiting:
+                    # read() возвращает только доступные сейчас байты. Граница
+                    # этого чтения не обязана совпадать с границей кадра.
                     raw_data = self.port.read(waiting)
 
                     for frame in decoder.feed(raw_data):
+                        # В интерфейс передаётся только полностью собранный и
+                        # проверенный кадр, а не необработанный поток байтов.
                         self.data_received.emit(frame)
 
                 else:
@@ -103,6 +105,9 @@ class SerialConnection(QtCore.QObject):
 
     received = QtCore.pyqtSignal(str)
     frame_received = QtCore.pyqtSignal(object)
+    # Отдельный сигнал нужен окну-отправителю: он возникает только после
+    # успешной физической записи сформированного кадра в COM-порт.
+    frame_sent = QtCore.pyqtSignal(object)
     error = QtCore.pyqtSignal(str)
 
     def __init__(
@@ -118,24 +123,21 @@ class SerialConnection(QtCore.QObject):
 
         self.port: Serial | None = None
         self.receiver: ReceiverThread | None = None
+        # The laboratory frame has a fixed 79-byte data field.  Characters
+        # are accumulated exactly as in the reference implementation and are
+        # put on the wire only when that field becomes full.
+        self._tx_buffer = bytearray()
+        self._tx_characters = 0
 
 
     @staticmethod
     def available_ports() -> Generator[str, None, None]:
         """Yield system COM-port names."""
-        LOGGER.debug("Enumerating serial ports.")
-
         return (item.device for item in list_ports.comports())
 
     def __enter__(self) -> Self:
         """Open the selected port and start receiving."""
         try:
-            LOGGER.info(
-                "Opening serial port %s at %s baud.",
-                self.port_name,
-                self.baud_rate,
-            )
-
             self.port = Serial(
                 port=self.port_name,
                 baudrate=self.baud_rate,
@@ -153,28 +155,18 @@ class SerialConnection(QtCore.QObject):
         ) as error:
             self.port = None
 
-            LOGGER.warning(
-                "Could not open serial port %s: %s",
-                self.port_name,
-                error,
-            )
-
             raise ConnectionError(
                 f"Could not open {self.port_name}: {error}"
             ) from error
 
         self.receiver = ReceiverThread(self.port)
 
+        # Приёмник работает в фоне; Qt безопасно передаст сигнал в поток GUI.
         self.receiver.data_received.connect(self._handle_frame)
 
         self.receiver.error_occurred.connect(self._handle_receiver_error)
 
         self.receiver.start()
-
-        LOGGER.info(
-            "Serial port %s is open.",
-            self.port_name,
-        )
 
         return self
 
@@ -192,6 +184,7 @@ class SerialConnection(QtCore.QObject):
         data = getattr(frame, "data", None)
         if not isinstance(data, bytes):
             return
+        # frame.data уже не содержит padding-нули и stuffing-биты.
         self.received.emit(data.decode("utf-8"))
         self.frame_received.emit(frame)
 
@@ -199,26 +192,30 @@ class SerialConnection(QtCore.QObject):
         self,
         character: str,
     ) -> FrameTransmission | None:
-        """Build and write one bit-stuffed frame for an entered character."""
+        """Add one character to the fixed packet currently being assembled."""
         if self.port is None or not self.port.is_open:
             self.error.emit("COM port is not open.")
             return None
 
         try:
-            transmission = encode_frame(character)
+            data = character.encode("utf-8")
+            if len(data) > MAX_DATA_SIZE:
+                raise ValueError("Character does not fit into the data field.")
 
-            written = self.port.write(transmission.wire)
+            if len(self._tx_buffer) + len(data) > MAX_DATA_SIZE:
+                # Многобайтный UTF-8-символ может не поместиться в остаток
+                # поля. Сначала отправляем накопленный кадр, затем начнём новый.
+                transmission = self._send_full_packet()
+                if transmission is None:
+                    return None
 
-            if written != len(transmission.wire):
-                self.error.emit("Send error: incomplete write.")
-                return None
-
-            LOGGER.debug(
-                "Sent one character through %s.",
-                self.port_name,
-            )
-
-            return transmission
+            self._tx_buffer.extend(data)
+            self._tx_characters += 1
+            if len(self._tx_buffer) == MAX_DATA_SIZE:
+                # Ровно 79 байт — поле данных заполнено, можно сформировать
+                # физический кадр размером 100 байт до stuffing.
+                return self._send_full_packet()
+            return None
 
         except SerialTimeoutException:
             self.error.emit("Send error: write timeout.")
@@ -231,15 +228,28 @@ class SerialConnection(QtCore.QObject):
             UnicodeEncodeError,
             ValueError,
         ) as error:
-            LOGGER.error(
-                "Could not send through %s: %s",
-                self.port_name,
-                error,
-            )
-
             self.error.emit(f"Send error: {error}")
 
             return None
+
+    def _send_full_packet(self) -> FrameTransmission | None:
+        """Serialize and write the currently full (or overflowed) data field."""
+        if self.port is None or not self._tx_buffer:
+            return None
+        transmission = encode_frame(bytes(self._tx_buffer))
+        # transmission.wire начинается с флага и содержит уже stuffed-тело.
+        written = self.port.write(transmission.wire)
+        if written != len(transmission.wire):
+            self.error.emit("Send error: incomplete write.")
+            return None
+        # Отправитель показывает свой кадр по этому событию, не ожидая, пока
+        # он пройдёт по кабелю и будет декодирован вторым экземпляром программы.
+        self.frame_sent.emit(transmission)
+        self._tx_buffer.clear()
+        # Счётчик нужен только для диагностического сообщения; данные уже
+        # отправлены, поэтому начинать следующий пакет нужно с нуля.
+        self._tx_characters = 0
+        return transmission
 
     def __exit__(
         self,
@@ -257,14 +267,10 @@ class SerialConnection(QtCore.QObject):
                 self.port.close()
 
             except (OSError, SerialException):
-                LOGGER.exception(
-                    "Error while closing serial port %s.",
-                    self.port_name,
-                )
+                pass
 
         self.port = None
-
-        LOGGER.info(
-            "Serial port %s is closed.",
-            self.port_name,
-        )
+        # Неполный пакет намеренно не отправляется при закрытии: условие
+        # исходной реализации требует передачи только заполненного буфера.
+        self._tx_buffer.clear()
+        self._tx_characters = 0

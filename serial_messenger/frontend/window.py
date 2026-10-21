@@ -3,18 +3,15 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
-import logging
 from typing import override
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 from backend import BAUD_RATES, SerialConnection
+# Тип результата передачи содержит байты кадра и представления для статуса.
 from backend.frame import FrameTransmission, encode_frame
 
 __all__ = ("SerialMessenger",)
-
-
-LOGGER = logging.getLogger(__name__)
 
 
 class ImmediateInput(QtWidgets.QPlainTextEdit):
@@ -26,7 +23,17 @@ class ImmediateInput(QtWidgets.QPlainTextEdit):
         """Create the immediate-transmission input area."""
         super().__init__()
 
+        # Подсказка объясняет режим: символ появляется в поле ввода сразу,
+        # а backend сам решает, когда накопился полный пакет для COM-порта.
         self.setPlaceholderText("Type here — every character is sent immediately")
+        # История ввода только пополняется: перетаскивание текста отключено.
+        self.setAcceptDrops(False)
+
+    def _move_cursor_to_end(self) -> None:
+        """Помещает курсор после последнего отображённого символа."""
+        cursor = self.textCursor()
+        cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+        self.setTextCursor(cursor)
 
     @override
     def keyPressEvent(
@@ -37,12 +44,35 @@ class ImmediateInput(QtWidgets.QPlainTextEdit):
         if event is None:
             return
 
+        # Введённые символы уже попали в буфер передачи, поэтому их нельзя
+        # удалять, вырезать или восстанавливать через Undo/Redo.
+        if event.key() in (
+            QtCore.Qt.Key.Key_Backspace,
+            QtCore.Qt.Key.Key_Delete,
+        ) or event.matches(QtGui.QKeySequence.StandardKey.Cut) or event.matches(
+            QtGui.QKeySequence.StandardKey.Undo
+        ) or event.matches(QtGui.QKeySequence.StandardKey.Redo):
+            return
+
         text = event.text()
 
-        if event.key() in (
+        # Enter не является частью данных пакета, но остаётся обычным переводом
+        # строки в визуальной истории набранного текста.
+        is_line_break = event.key() in (
             QtCore.Qt.Key.Key_Return,
             QtCore.Qt.Key.Key_Enter,
+        )
+
+        # The input history is append-only: before adding text, a line break
+        # or clipboard contents, restore the insertion point to its end.
+        if (
+            text
+            or is_line_break
+            or event.matches(QtGui.QKeySequence.StandardKey.Paste)
         ):
+            self._move_cursor_to_end()
+
+        if is_line_break:
             super().keyPressEvent(event)
             self.character_entered.emit("\n")
             return
@@ -50,7 +80,34 @@ class ImmediateInput(QtWidgets.QPlainTextEdit):
         super().keyPressEvent(event)
 
         if text and text.isprintable():
+            # Сигнал не пишет в порт напрямую: его обрабатывает SerialConnection.
             self.character_entered.emit(text)
+
+    @override
+    def mousePressEvent(
+        self,
+        event: QtGui.QMouseEvent | None,
+    ) -> None:
+        """Do not leave the insertion point in the middle after a click."""
+        if event is None:
+            return
+
+        super().mousePressEvent(event)
+
+        # Нельзя позволить пользователю вставлять символы в середину уже
+        # отображённой истории: порядок в поле должен совпадать с порядком
+        # добавления символов в буфер передатчика.
+        self._move_cursor_to_end()
+
+    @override
+    def contextMenuEvent(
+        self,
+        event: QtGui.QContextMenuEvent | None,
+    ) -> None:
+        """Hide context-menu actions that can alter existing input."""
+        # В стандартном меню есть Cut, Undo и другие команды изменения текста.
+        if event is not None:
+            event.accept()
 
 
 class SerialMessenger(QtWidgets.QWidget):
@@ -60,9 +117,13 @@ class SerialMessenger(QtWidgets.QWidget):
         """Build the application window."""
         super().__init__()
 
+        # connection существует только после успешного открытия выбранного порта.
         self.connection: SerialConnection | None = None
+        # ExitStack гарантированно вызовет __exit__() соединения при закрытии
+        # окна, смене скорости или ошибке соединения.
         self._connection_scope = ExitStack()
 
+        # Этот счётчик относится к интерфейсу, а не к размеру байтового буфера.
         self.sent_characters = 0
         # Prevent recursive or repeated QMessageBox calls caused by
         # queued serial signals.
@@ -72,6 +133,8 @@ class SerialMessenger(QtWidgets.QWidget):
         self.resize(1200, 900)
         self.setMinimumSize(640, 420)
 
+        # Интерфейс собирается до подключения сигналов: пользователь не сможет
+        # вызвать обработчик для ещё не созданного виджета.
         self._create_widgets()
         self._create_layout()
         self._apply_style()
@@ -83,6 +146,8 @@ class SerialMessenger(QtWidgets.QWidget):
 
     def _create_widgets(self) -> None:
         """Create controls and text widgets."""
+        # Списки порта и скорости существуют отдельно, потому что скорость
+        # становится доступна только после выбора конкретного COM-порта.
         self.port_choice = QtWidgets.QComboBox()
 
         self.baud_rate_choice = QtWidgets.QComboBox()
@@ -96,22 +161,55 @@ class SerialMessenger(QtWidgets.QWidget):
         self.baud_rate_choice.setCurrentIndex(-1)
         self.baud_rate_choice.setEnabled(False)
 
+        # До открытия порта ввод заблокирован: нельзя накопить локальные данные,
+        # которые пользователь ошибочно будет считать отправленными.
         self.input_area = ImmediateInput()
         self.input_area.setEnabled(False)
         self.input_area.setVerticalScrollBarPolicy(
             QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
 
+        # Поле Output доступно только для чтения, так как его содержимое пришло
+        # из успешно декодированных кадров удалённого устройства.
         self.output_area = QtWidgets.QPlainTextEdit()
         self.output_area.setReadOnly(True)
         self.output_area.setVerticalScrollBarPolicy(
             QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
 
-        self.state_label = QtWidgets.QTextBrowser()
-        self.state_label.setReadOnly(True)
-        self.state_label.setOpenExternalLinks(False)
-        self.state_label.setMinimumHeight(145)
+        # Шапка находится отдельно от журнала кадров и остаётся видимой при
+        # прокрутке. Зарезервированные байты намеренно не перечисляются.
+        self.field_names_label = QtWidgets.QLabel(
+            "StartFlag FrameType FrameNumber Data Checksum"
+        )
+        self.field_names_label.setObjectName("fieldNamesLabel")
+        self.field_names_label.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+        self.field_names_label.setWordWrap(True)
+        # QTextBrowser понимает HTML: вставленные stuffing-биты отображаются
+        # подчёркнутыми тегом <u>0</u> или <u>1</u>.
+        self.status_area = QtWidgets.QTextBrowser()
+        self.status_area.setReadOnly(True)
+        # Если кадр не помещается по ширине, Qt переносит отображение; полоса
+        # прокрутки нужна только вертикальная, справа от области состояния.
+        self.status_area.setLineWrapMode(
+            QtWidgets.QTextEdit.LineWrapMode.WidgetWidth
+        )
+        self.status_area.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        # Data — длинная непрерывная строка битов. Разрешаем перенос
+        # внутри неё, чтобы она занимала остаток строки после FrameNumber.
+        text_option = self.status_area.document().defaultTextOption()
+        text_option.setWrapMode(QtGui.QTextOption.WrapMode.WrapAnywhere)
+        self.status_area.document().setDefaultTextOption(text_option)
+        self.status_area.setOpenExternalLinks(False)
+        self.status_area.setMinimumHeight(145)
+        self.status_area.setVerticalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+
+        self.sent_characters_label = QtWidgets.QLabel()
+        self.sent_characters_label.setObjectName("stateLabel")
 
     def _create_layout(self) -> None:
         """Arrange the resizable controls and text areas."""
@@ -120,29 +218,33 @@ class SerialMessenger(QtWidgets.QWidget):
         layout.setHorizontalSpacing(12)
         layout.setVerticalSpacing(12)
 
-        port_box = self._section("COM port")
-        self._content_layout(port_box).addWidget(self.port_choice)
+        port_box, port_layout = self._section("COM port")
+        port_layout.addWidget(self.port_choice)
 
-        baud_rate_box = self._section("Baud rate")
-        self._content_layout(baud_rate_box).addWidget(self.baud_rate_choice)
+        baud_rate_box, baud_rate_layout = self._section("Baud rate")
+        baud_rate_layout.addWidget(self.baud_rate_choice)
 
+        # Верхняя строка содержит настройки соединения, средняя — текстовый
+        # обмен, нижняя — диагностику сформированных пакетов.
         controls = QtWidgets.QHBoxLayout()
         controls.addWidget(port_box)
         controls.addWidget(baud_rate_box)
         controls.addStretch()
         layout.addLayout(controls, 0, 0, 1, 2)
 
-        outgoing = self._section("Input")
-        self._content_layout(outgoing).addWidget(self.input_area)
+        outgoing, outgoing_layout = self._section("Input")
+        outgoing_layout.addWidget(self.input_area)
 
-        incoming = self._section("Output")
-        self._content_layout(incoming).addWidget(self.output_area)
+        incoming, incoming_layout = self._section("Output")
+        incoming_layout.addWidget(self.output_area)
 
         layout.addWidget(outgoing, 1, 0)
         layout.addWidget(incoming, 1, 1)
-        state = self._section("Frame status")
-        self._content_layout(state).addWidget(self.state_label)
+        state, state_layout = self._section("Status")
+        state_layout.addWidget(self.field_names_label)
+        state_layout.addWidget(self.status_area)
         layout.addWidget(state, 2, 0, 1, 2)
+        layout.addWidget(self.sent_characters_label, 3, 0, 1, 2)
 
         layout.setRowStretch(1, 1)
         layout.setColumnStretch(0, 1)
@@ -151,30 +253,17 @@ class SerialMessenger(QtWidgets.QWidget):
     @staticmethod
     def _section(
         title: str,
-    ) -> QtWidgets.QGroupBox:
-        """Create a titled visual section."""
+    ) -> tuple[QtWidgets.QGroupBox, QtWidgets.QVBoxLayout]:
+        """Создаёт визуальную секцию и сразу возвращает её внутренний layout."""
         section = QtWidgets.QGroupBox(title)
-        box = QtWidgets.QVBoxLayout(section)
-        box.setContentsMargins(10, 18, 10, 10)
-        return section
-
-    @staticmethod
-    def _content_layout(
-        frame: QtWidgets.QGroupBox,
-    ) -> QtWidgets.QVBoxLayout:
-        """Return the section's vertical content layout."""
-        layout = frame.layout()
-
-        if not isinstance(
-            layout,
-            QtWidgets.QVBoxLayout,
-        ):
-            raise TypeError("Section does not have a vertical layout.")
-
-        return layout
+        layout = QtWidgets.QVBoxLayout(section)
+        layout.setContentsMargins(10, 18, 10, 10)
+        return section, layout
 
     def _connect_signals(self) -> None:
         """Connect UI signals."""
+        # Любое действие пользователя проходит через Qt-сигнал, поэтому GUI
+        # остаётся отзывчивым, а чтение самого COM-порта работает в фоне.
         self.port_choice.currentIndexChanged.connect(self._port_selected)
 
         self.baud_rate_choice.currentIndexChanged.connect(self._change_baud_rate)
@@ -183,6 +272,8 @@ class SerialMessenger(QtWidgets.QWidget):
 
     def _load_ports(self) -> None:
         """Load currently available serial ports."""
+        # Здесь используются только системные имена (COM3, COM10 и т. п.),
+        # поскольку именно их принимает pyserial при открытии соединения.
         ports = list(SerialConnection.available_ports())
 
         self.port_choice.addItems(ports)
@@ -197,6 +288,8 @@ class SerialMessenger(QtWidgets.QWidget):
         if self._handling_error:
             return
 
+        # Пустая строка означает, что пользователь снял выбор и соединение
+        # открывать нельзя.
         has_port = bool(self.port_choice.currentText().strip())
         self.baud_rate_choice.setEnabled(has_port)
 
@@ -208,6 +301,8 @@ class SerialMessenger(QtWidgets.QWidget):
 
     def _try_open(self) -> None:
         """Open the selected COM port when both choices exist."""
+        # Одновременно поддерживается ровно одно активное последовательное
+        # соединение: это предотвращает два потока чтения одного порта.
         if self.connection is not None:
             return
 
@@ -222,6 +317,8 @@ class SerialMessenger(QtWidgets.QWidget):
             return
 
         try:
+            # Контекстный менеджер создаёт Serial, запускает ReceiverThread и
+            # передаёт управление обратно только после успешного открытия.
             connection = self._connection_scope.enter_context(
                 SerialConnection(
                     port_name,
@@ -230,11 +327,6 @@ class SerialMessenger(QtWidgets.QWidget):
             )
 
         except ConnectionError as error:
-            LOGGER.warning(
-                "Connection attempt failed: %s",
-                error,
-            )
-
             self._show_open_error(str(error))
 
             return
@@ -245,12 +337,11 @@ class SerialMessenger(QtWidgets.QWidget):
 
         connection.frame_received.connect(self._show_received_frame)
 
-        connection.error.connect(self._show_error)
+        # В этом же окне отображаем кадр сразу после его успешной записи.
+        # Приёмник использует независимый сигнал frame_received выше.
+        connection.frame_sent.connect(self._show_frame)
 
-        LOGGER.info(
-            "Connected frontend to serial port %s.",
-            port_name,
-        )
+        connection.error.connect(self._show_error)
 
         self._port_opened()
 
@@ -267,6 +358,8 @@ class SerialMessenger(QtWidgets.QWidget):
             return
 
         if self.connection is not None:
+            # Изменение скорости требует переоткрытия порта, чтобы параметры
+            # обеих сторон последовательного соединения были единообразны.
             if baud_rate == self.connection.baud_rate:
                 return
             self._close_connection()
@@ -275,6 +368,8 @@ class SerialMessenger(QtWidgets.QWidget):
 
     def _port_opened(self) -> None:
         """Lock the port but allow changing baud rate and enable input."""
+        # Имя порта фиксируется, пока идёт обмен; скорость при этом можно
+        # изменить, что корректно закроет и заново откроет соединение.
         self.port_choice.setEnabled(False)
         self.input_area.setEnabled(True)
         self.input_area.setFocus()
@@ -284,21 +379,33 @@ class SerialMessenger(QtWidgets.QWidget):
         character: str,
     ) -> None:
         """Send one entered character."""
+        # Окно не формирует кадры само: оно передаёт символ backend-слою.
         connection = self.connection
 
         if connection is None:
             return
 
-        transmission = connection.send_character(character)
-        if transmission is not None:
-            self.sent_characters += 1
-            self._show_frame(transmission)
+        connection.send_character(character)
+
+        # Считаем именно введённые символы данных, а не количество кадров.
+        # Кадр появляется лишь после заполнения 79-байтового поля, поэтому
+        # увеличивать счётчик внутри условия ниже было бы неверно. Вставленные
+        # bit-stuffing биты сюда не попадают: они добавляются позже в backend.
+        # Перенос строки тоже является передаваемым символом и учитывается
+        # наравне с буквами и цифрами.
+        self.sent_characters += 1
+        self._refresh_state()
+
+        # Отображение отправленного кадра выполняет сигнал frame_sent. Это
+        # работает и при отправке кадра перед многобайтным UTF-8-символом.
 
     def _append_received(
         self,
         text: str,
     ) -> None:
         """Append received user data to the output area."""
+        # Вставляем текст в конец, чтобы приходящие кадры не меняли уже
+        # показанную историю сообщений.
         cursor = self.output_area.textCursor()
 
         cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
@@ -319,22 +426,27 @@ class SerialMessenger(QtWidgets.QWidget):
 
     def _refresh_state(self) -> None:
         """Refresh the status display."""
-        self.state_label.setHtml(
-            "<b>Флаг Данные Тип Приоритет Контроль Резерв</b>"
+        self.sent_characters_label.setText(
+            f"Sent characters: {self.sent_characters}"
         )
 
     def _show_frame(self, transmission: FrameTransmission) -> None:
-        """Show the most recently transmitted frame before and after stuffing."""
-        self.state_label.append(transmission.before)
-        self.state_label.append(transmission.after_html)
-        self.state_label.verticalScrollBar().setValue(
-            self.state_label.verticalScrollBar().maximum()
+        """Show only the current frame before and after bit stuffing."""
+        # Новый кадр заменяет предыдущий. В области остаются только значения
+        # полей: первая строка до stuffing, вторая — после него.
+        self.status_area.setHtml(
+            f'{transmission.before}<br>{transmission.after_html}'
+        )
+        self.status_area.verticalScrollBar().setValue(
+            self.status_area.verticalScrollBar().maximum()
         )
 
     def _show_received_frame(self, frame: object) -> None:
         """Show the last recognized incoming frame in the same required format."""
         data = getattr(frame, "data", None)
         if isinstance(data, bytes):
+            # У принятого Frame уже удалены stuffing-биты. Повторное кодирование
+            # здесь нужно только для одинакового отображения в окне статуса.
             self._show_frame(encode_frame(data.decode("utf-8")))
 
     def _show_open_error(
@@ -345,6 +457,7 @@ class SerialMessenger(QtWidgets.QWidget):
         if self._handling_error:
             return
 
+        # Флаг предотвращает повторный показ того же окна ошибки из очереди Qt.
         self._handling_error = True
 
         try:
@@ -375,11 +488,8 @@ class SerialMessenger(QtWidgets.QWidget):
         self._handling_error = True
 
         try:
-            LOGGER.error(
-                "User-visible serial error: %s",
-                message,
-            )
-
+            # Сначала закрываем соединение и возвращаем интерфейс в исходное
+            # состояние, затем показываем сообщение пользователю.
             self._reset_connection_controls()
 
             QtWidgets.QMessageBox.critical(
@@ -400,23 +510,23 @@ class SerialMessenger(QtWidgets.QWidget):
 
         # Clear the reference FIRST so any queued error signal from the
         # old connection is ignored by _show_error().
+        # Ссылка обнуляется до остановки потока: поздний сигнал старого порта
+        # будет проигнорирован обработчиком ошибки.
         self.connection = None
 
         if connection is not None:
-            try:
-                connection.received.disconnect(self._append_received)
-            except TypeError:
-                pass
-
-            try:
-                connection.error.disconnect(self._show_error)
-            except TypeError:
-                pass
-
-            try:
-                connection.frame_received.disconnect(self._show_received_frame)
-            except TypeError:
-                pass
+            # Все сигналы отключаются одинаково; TypeError означает, что
+            # обработчик уже не был подключён к данному соединению.
+            for signal, handler in (
+                (connection.received, self._append_received),
+                (connection.error, self._show_error),
+                (connection.frame_received, self._show_received_frame),
+                (connection.frame_sent, self._show_frame),
+            ):
+                try:
+                    signal.disconnect(handler)
+                except TypeError:
+                    pass
 
         self._connection_scope.close()
         self._connection_scope = ExitStack()
@@ -428,6 +538,7 @@ class SerialMessenger(QtWidgets.QWidget):
         """
         self._close_connection()
 
+        # После ошибки пользователь снова может выбрать порт и скорость.
         self.port_choice.setEnabled(True)
 
         # Clear the port first. Programmatically changing
@@ -442,6 +553,8 @@ class SerialMessenger(QtWidgets.QWidget):
 
     def _apply_style(self) -> None:
         """Apply the application style."""
+        # Стили заданы в одном месте, чтобы не смешивать внешний вид с логикой
+        # сборки/разбора кадров.
         self.setStyleSheet("""
             QWidget {
                 background: #f0f0f0;
@@ -474,6 +587,14 @@ class SerialMessenger(QtWidgets.QWidget):
                 padding: 4px;
                 selection-background-color: #9bbcff;
             }
+
+            QTextBrowser {
+                background: white;
+                border: 1px solid #303030;
+                padding: 4px;
+                selection-background-color: #9bbcff;
+            }
+
             """)
 
     @override
@@ -482,9 +603,9 @@ class SerialMessenger(QtWidgets.QWidget):
         event: QtGui.QCloseEvent | None,
     ) -> None:
         """Close timers and the serial connection before exiting."""
+        # Останавливаем поток чтения раньше закрытия Qt-приложения, иначе он
+        # мог бы обратиться к уже уничтоженным объектам интерфейса.
         self._close_connection()
-
-        LOGGER.info("Serial Messenger window closed.")
 
         if event is not None:
             event.accept()
